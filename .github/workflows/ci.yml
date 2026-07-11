@@ -1,0 +1,130 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# ВАЖНО (мульти-репо): go.mod содержит replace на ../linkpulse-contracts,
+# поэтому CI дополнительно чекаутит contracts в соседнюю папку. После публикации
+# contracts как Go-модуля (git-тег в его репозитории) replace и второй checkout
+# удаляются, пайплайн упрощается до стандартного.
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: linkpulse-analytics
+      - uses: actions/checkout@v5
+        with:
+          repository: 1RAFTIK1/linkpulse-contracts
+          path: linkpulse-contracts
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: true
+          cache-dependency-path: linkpulse-analytics/go.sum
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.11.4
+          working-directory: linkpulse-analytics
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: linkpulse-analytics
+      - uses: actions/checkout@v5
+        with:
+          repository: 1RAFTIK1/linkpulse-contracts
+          path: linkpulse-contracts
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: true
+          cache-dependency-path: linkpulse-analytics/go.sum
+      - name: go test (race)
+        working-directory: linkpulse-analytics
+        run: go test -race -count=1 ./...
+
+  security:
+    name: security scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: linkpulse-analytics
+      - uses: actions/checkout@v5
+        with:
+          repository: 1RAFTIK1/linkpulse-contracts
+          path: linkpulse-contracts
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: true
+          cache-dependency-path: linkpulse-analytics/go.sum
+      - name: govulncheck
+        working-directory: linkpulse-analytics
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+      - name: gosec
+        working-directory: linkpulse-analytics
+        run: |
+          go install github.com/securego/gosec/v2/cmd/gosec@latest
+          gosec ./...
+
+  docker:
+    name: docker build & scan
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: linkpulse-analytics
+      - uses: actions/checkout@v5
+        with:
+          repository: 1RAFTIK1/linkpulse-contracts
+          path: linkpulse-contracts
+
+      # Контекст — родительская папка (см. комментарий в Dockerfile).
+      - name: Build image
+        run: docker build -f linkpulse-analytics/Dockerfile -t ghcr.io/${{ github.repository }}:${{ github.sha }} .
+
+      - name: Trivy scan
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          image-ref: ghcr.io/${{ github.repository }}:${{ github.sha }}
+          format: table
+          exit-code: "1"
+          severity: HIGH,CRITICAL
+
+      - name: Login to GHCR
+        if: github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image
+        if: github.ref == 'refs/heads/main'
+        run: |
+          docker tag ghcr.io/${{ github.repository }}:${{ github.sha }} ghcr.io/${{ github.repository }}:latest
+          docker push ghcr.io/${{ github.repository }}:${{ github.sha }}
+          docker push ghcr.io/${{ github.repository }}:latest
