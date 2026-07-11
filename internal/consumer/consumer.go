@@ -20,18 +20,26 @@ import (
 	eventsv1 "github.com/1RAFTIK1/linkpulse-contracts/gen/go/events/v1"
 )
 
-// Storage — приёмник батчей событий (Postgres в проде).
+// Storage — приёмник батчей событий (Postgres в проде). Возвращает события,
+// реально вставленные в этом вызове (без дублей).
 type Storage interface {
-	SaveBatch(ctx context.Context, events []*eventsv1.ClickEvent) error
+	SaveBatch(ctx context.Context, events []*eventsv1.ClickEvent) ([]*eventsv1.ClickEvent, error)
+}
+
+// Publisher — приёмник live-событий (fan-out хаб gRPC-стримов). Получает
+// только новые события: дубли переигранных батчей сюда не попадают.
+type Publisher interface {
+	Publish(events []*eventsv1.ClickEvent)
 }
 
 type Consumer struct {
 	client *kgo.Client
 	store  Storage
+	pub    Publisher
 	log    *slog.Logger
 }
 
-func New(ctx context.Context, brokers []string, topic, group string, store Storage, log *slog.Logger) (*Consumer, error) {
+func New(ctx context.Context, brokers []string, topic, group string, store Storage, pub Publisher, log *slog.Logger) (*Consumer, error) {
 	client, err := kgo.NewClient(
 		kgo.SeedBrokers(brokers...),
 		kgo.ConsumeTopics(topic),
@@ -49,7 +57,7 @@ func New(ctx context.Context, brokers []string, topic, group string, store Stora
 		client.Close()
 		return nil, fmt.Errorf("kafka ping: %w", err)
 	}
-	return &Consumer{client: client, store: store, log: log}, nil
+	return &Consumer{client: client, store: store, pub: pub, log: log}, nil
 }
 
 // Run крутит poll-цикл до отмены ctx. Возвращает ошибку только при сбое
@@ -77,8 +85,14 @@ func (c *Consumer) Run(ctx context.Context) error {
 		}
 
 		events := c.decode(ctx, records)
-		if err := c.store.SaveBatch(ctx, events); err != nil {
+		inserted, err := c.store.SaveBatch(ctx, events)
+		if err != nil {
 			return fmt.Errorf("сохранение батча (%d событий): %w", len(events), err)
+		}
+
+		// Live-лента получает только новые события — уже после фиксации в БД.
+		if c.pub != nil {
+			c.pub.Publish(inserted)
 		}
 
 		if err := c.client.CommitRecords(ctx, records...); err != nil {

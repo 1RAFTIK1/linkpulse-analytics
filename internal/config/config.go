@@ -17,6 +17,8 @@ type Config struct {
 	KafkaTopic   string
 	KafkaGroup   string // consumer group — офсеты хранятся на группу
 
+	GRPCAddr string // адрес gRPC API (GetLinkStats, StreamLiveClicks)
+
 	ShutdownTimeout time.Duration
 }
 
@@ -28,6 +30,7 @@ func Load() (Config, error) {
 		KafkaBrokers:    splitNonEmpty(getEnv("KAFKA_BROKERS", "localhost:9092")),
 		KafkaTopic:      getEnv("KAFKA_TOPIC", "link-clicks"),
 		KafkaGroup:      getEnv("KAFKA_GROUP", "analytics-service"),
+		GRPCAddr:        getEnv("GRPC_ADDR", ":50051"),
 		ShutdownTimeout: 10 * time.Second,
 	}
 

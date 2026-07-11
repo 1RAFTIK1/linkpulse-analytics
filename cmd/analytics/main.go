@@ -1,18 +1,27 @@
-// Analytics service — консьюмер топика link-clicks: идемпотентная запись
-// кликов и часовая агрегация. gRPC API (GetLinkStats, StreamLiveClicks)
-// добавляется в фазе 4.
+// Analytics service — консьюмер топика link-clicks (идемпотентная запись,
+// часовая агрегация) + gRPC API: GetLinkStats и StreamLiveClicks (live-события
+// для дашборда через in-memory fan-out).
 package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"google.golang.org/grpc"
+
+	analyticsv1 "github.com/1RAFTIK1/linkpulse-contracts/gen/go/analytics/v1"
+
 	"github.com/1RAFTIK1/linkpulse-analytics/internal/config"
 	"github.com/1RAFTIK1/linkpulse-analytics/internal/consumer"
+	"github.com/1RAFTIK1/linkpulse-analytics/internal/fanout"
+	"github.com/1RAFTIK1/linkpulse-analytics/internal/grpcapi"
 	"github.com/1RAFTIK1/linkpulse-analytics/internal/storage"
 )
 
@@ -44,15 +53,63 @@ func run(log *slog.Logger) error {
 	}
 	defer store.Close()
 
-	cons, err := consumer.New(initCtx, cfg.KafkaBrokers, cfg.KafkaTopic, cfg.KafkaGroup, store, log)
+	hub := fanout.New(log)
+
+	cons, err := consumer.New(initCtx, cfg.KafkaBrokers, cfg.KafkaTopic, cfg.KafkaGroup, store, hub, log)
 	if err != nil {
 		return err
 	}
 	defer cons.Close()
 
-	log.Info("analytics запущен", "brokers", cfg.KafkaBrokers, "topic", cfg.KafkaTopic, "group", cfg.KafkaGroup)
+	// gRPC-сервер — в отдельной горутине рядом с консьюмером.
+	grpcServer := grpc.NewServer()
+	analyticsv1.RegisterAnalyticsServiceServer(grpcServer, grpcapi.NewServer(store, hub, log))
 
-	// Run блокируется до SIGTERM/SIGINT (ctx) или фатальной ошибки БД.
-	// Graceful shutdown по спеке §11: цикл сам не коммитит недообработанное.
-	return cons.Run(ctx)
+	var lc net.ListenConfig
+	lis, err := lc.Listen(ctx, "tcp", cfg.GRPCAddr)
+	if err != nil {
+		return fmt.Errorf("listen grpc: %w", err)
+	}
+
+	errCh := make(chan error, 2)
+	go func() {
+		log.Info("grpc сервер запущен", "addr", cfg.GRPCAddr)
+		if err := grpcServer.Serve(lis); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
+			errCh <- fmt.Errorf("grpc serve: %w", err)
+		}
+	}()
+	go func() {
+		log.Info("analytics запущен", "brokers", cfg.KafkaBrokers, "topic", cfg.KafkaTopic, "group", cfg.KafkaGroup)
+		errCh <- cons.Run(ctx) // блокируется до отмены ctx или ошибки БД
+	}()
+
+	// Ждём сигнал (ctx) или фатальную ошибку любой из горутин.
+	select {
+	case err := <-errCh:
+		grpcServer.Stop()
+		return err
+	case <-ctx.Done():
+	}
+
+	// Graceful shutdown: GracefulStop дожидается активных RPC (стримы получат
+	// отмену ctx), с таймаутом на случай зависших клиентов.
+	log.Info("получен сигнал, останавливаемся", "timeout", cfg.ShutdownTimeout)
+	done := make(chan struct{})
+	go func() {
+		grpcServer.GracefulStop()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(cfg.ShutdownTimeout):
+		log.Warn("grpc GracefulStop не уложился в таймаут, останавливаем принудительно")
+		grpcServer.Stop()
+	}
+
+	// Консьюмер выходит сам по отмене ctx (без коммита недообработанного).
+	if err := <-errCh; err != nil {
+		return err
+	}
+	log.Info("сервис остановлен корректно")
+	return nil
 }

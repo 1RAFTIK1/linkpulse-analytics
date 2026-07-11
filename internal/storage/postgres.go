@@ -44,14 +44,18 @@ type bucketKey struct {
 // Идемпотентность: PRIMARY KEY(id=event_id) + ON CONFLICT DO NOTHING. Дубль
 // (повторная доставка после ребаланса) не вставляется, и — принципиально —
 // НЕ инкрементирует агрегат: смотрим RowsAffected каждой вставки.
-func (p *Postgres) SaveBatch(ctx context.Context, events []*eventsv1.ClickEvent) error {
+//
+// Возвращает события, вставленные ИМЕННО в этом вызове: их (и только их)
+// консьюмер раздаёт в live-стримы — переигранный батч не порождает
+// «призрачных» кликов на дашборде.
+func (p *Postgres) SaveBatch(ctx context.Context, events []*eventsv1.ClickEvent) ([]*eventsv1.ClickEvent, error) {
 	if len(events) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("begin tx: %w", err)
+		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // rollback после commit — no-op
 
@@ -61,18 +65,18 @@ func (p *Postgres) SaveBatch(ctx context.Context, events []*eventsv1.ClickEvent)
 		ON CONFLICT (id) DO NOTHING`
 
 	buckets := make(map[bucketKey]int64)
-	var dups int
+	inserted := make([]*eventsv1.ClickEvent, 0, len(events))
 	for _, ev := range events {
 		tag, err := tx.Exec(ctx, insertClick,
 			ev.GetEventId(), ev.GetLinkId(), ev.GetShortCode(),
 			ev.GetClickedAt().AsTime(), ev.GetReferrer(), ev.GetCountry())
 		if err != nil {
-			return fmt.Errorf("insert click %d: %w", ev.GetEventId(), err)
+			return nil, fmt.Errorf("insert click %d: %w", ev.GetEventId(), err)
 		}
 		if tag.RowsAffected() == 0 {
-			dups++ // дубль — агрегат не трогаем
-			continue
+			continue // дубль — ни агрегат, ни live-лента его не видят
 		}
+		inserted = append(inserted, ev)
 		key := bucketKey{
 			linkID: ev.GetLinkId(),
 			hour:   ev.GetClickedAt().AsTime().UTC().Truncate(time.Hour),
@@ -88,16 +92,56 @@ func (p *Postgres) SaveBatch(ctx context.Context, events []*eventsv1.ClickEvent)
 
 	for key, n := range buckets {
 		if _, err := tx.Exec(ctx, upsertBucket, key.linkID, key.hour, n); err != nil {
-			return fmt.Errorf("upsert bucket link=%d hour=%s: %w", key.linkID, key.hour, err)
+			return nil, fmt.Errorf("upsert bucket link=%d hour=%s: %w", key.linkID, key.hour, err)
 		}
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit tx: %w", err)
+		return nil, fmt.Errorf("commit tx: %w", err)
 	}
 
-	if dups > 0 {
+	if dups := len(events) - len(inserted); dups > 0 {
 		p.log.InfoContext(ctx, "батч сохранён с дублями", "events", len(events), "duplicates", dups)
 	}
-	return nil
+	return inserted, nil
+}
+
+// HourlyBucket — часовой интервал для GetLinkStats.
+type HourlyBucket struct {
+	Hour  time.Time
+	Count int64
+}
+
+// GetLinkStats возвращает сумму и часовую разбивку кликов ссылки за период
+// (границы включительно). Читает денормализованный агрегат, а не COUNT(*)
+// по фактам — дёшево при любом объёме кликов.
+func (p *Postgres) GetLinkStats(ctx context.Context, linkID int64, from, to time.Time) (int64, []HourlyBucket, error) {
+	const q = `
+		SELECT hour_bucket, click_count
+		FROM link_stats_hourly
+		WHERE link_id = $1 AND hour_bucket BETWEEN $2 AND $3
+		ORDER BY hour_bucket`
+
+	rows, err := p.pool.Query(ctx, q, linkID, from.UTC(), to.UTC())
+	if err != nil {
+		return 0, nil, fmt.Errorf("select stats: %w", err)
+	}
+	defer rows.Close()
+
+	var (
+		total   int64
+		buckets []HourlyBucket
+	)
+	for rows.Next() {
+		var b HourlyBucket
+		if err := rows.Scan(&b.Hour, &b.Count); err != nil {
+			return 0, nil, fmt.Errorf("scan bucket: %w", err)
+		}
+		total += b.Count
+		buckets = append(buckets, b)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, nil, fmt.Errorf("iterate buckets: %w", err)
+	}
+	return total, buckets, nil
 }
