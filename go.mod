@@ -1,6 +1,6 @@
 module github.com/1RAFTIK1/linkpulse-analytics
 
-go 1.26.1
+go 1.26.5
 
 replace github.com/1RAFTIK1/linkpulse-contracts => ../linkpulse-contracts
 
