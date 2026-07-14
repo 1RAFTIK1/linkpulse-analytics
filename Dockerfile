@@ -4,7 +4,7 @@
 # replace на ../linkpulse-contracts — поэтому контекст сборки должен быть
 # родительской папкой: docker build -f linkpulse-analytics/Dockerfile .
 # После публикации contracts на GitHub replace уйдёт и контекст станет обычным.
-FROM golang:1.26-alpine AS build
+FROM golang:1.26.5-alpine AS build
 
 WORKDIR /src
 
