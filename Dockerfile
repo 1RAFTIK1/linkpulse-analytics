@@ -15,7 +15,7 @@ RUN go mod download
 COPY linkpulse-analytics/ .
 RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/analytics ./cmd/analytics
 
-FROM alpine:3.22
+FROM alpine:3.24
 
 RUN adduser -D -u 10001 app
 USER app
