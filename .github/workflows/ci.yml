@@ -28,7 +28,7 @@ jobs:
         with:
           repository: 1RAFTIK1/linkpulse-contracts
           path: linkpulse-contracts
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version-file: linkpulse-analytics/go.mod
           cache: true
@@ -50,7 +50,7 @@ jobs:
         with:
           repository: 1RAFTIK1/linkpulse-contracts
           path: linkpulse-contracts
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version-file: linkpulse-analytics/go.mod
           cache: true
@@ -70,7 +70,7 @@ jobs:
         with:
           repository: 1RAFTIK1/linkpulse-contracts
           path: linkpulse-contracts
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version-file: linkpulse-analytics/go.mod
           cache: true
